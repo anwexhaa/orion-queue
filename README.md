@@ -130,10 +130,23 @@ source venv/bin/activate     # Mac/Linux
 
 pip install -r requirements.txt
 
-docker-compose up -d
+docker compose up -d redis
 
 python main.py
 ```
+
+Or run the whole stack in containers, shaped the way it is deployed — API,
+worker and scheduler as separate processes from one image:
+
+```bash
+docker compose up --build
+```
+
+| Service | URL |
+|---------|-----|
+| API | http://localhost:8000 |
+| Worker probes and metrics | http://localhost:8001 |
+| Scheduler probes and metrics | http://localhost:8002 |
 
 ---
 
@@ -164,13 +177,92 @@ Response:
 GET /status/{job_id}
 ```
 
-### Queue metrics
+### Metrics
 
 ```
 GET /metrics
 ```
 
-Returns current queue depth and dead letter queue size.
+Prometheus text exposition format. Exposes queue depth, dead letter depth,
+jobs submitted and processed by terminal status, retry counts, job duration,
+and dispatch latency.
+
+`orion_dispatch_latency_seconds` — the time between a job being submitted and
+a worker starting it — has an explicit bucket boundary at 0.3s, because the
+latency objective is "95% of jobs dispatched within 300 ms" and a histogram
+can only answer that exactly if the threshold is a bucket edge.
+
+### Queue stats
+
+```
+GET /stats
+```
+
+```json
+{"queue_size": 12, "dead_jobs": 0}
+```
+
+The original JSON payload, kept because KEDA's `metrics-api` scaler reads JSON
+rather than the Prometheus format.
+
+### Health and readiness
+
+```
+GET /health    liveness  — always 200 while the process is responsive
+GET /ready     readiness — 200 when Redis is reachable, 503 when it is not
+```
+
+These are deliberately different checks. Liveness does not touch Redis: a
+liveness probe that fails during a Redis outage would restart every pod at
+once, turning a recoverable dependency problem into a full outage. Readiness
+does touch Redis, because a process that cannot reach it cannot do any work
+and should be taken out of the load balancer until it can.
+
+All three processes — API, worker and scheduler — serve these paths.
+
+---
+
+## Configuration
+
+Everything is read from the environment. Every default is the value that used
+to be hardcoded, so nothing needs setting to run locally.
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `REDIS_HOST` | `localhost` | Must be set in Kubernetes, where `localhost` is the pod itself |
+| `REDIS_PORT` | `6379` | |
+| `REDIS_DB` | `0` | |
+| `REDIS_PASSWORD` | unset | |
+| `QUEUE_KEY` | `task_queue` | |
+| `DLQ_KEY` | `dead_letter_queue` | |
+| `DELAYED_KEY` | `delayed_queue` | |
+| `WORKER_COUNT` | `4` | Threads per worker process |
+| `SCHEDULER_POLL_INTERVAL` | `0.5` | Seconds |
+| `HTTP_HOST` | `0.0.0.0` | |
+| `HTTP_PORT` | `8000` | |
+| `ORION_ROLE` | `all-in-one` | Label for logs and metrics |
+
+---
+
+## Process topology
+
+One image, three entrypoints:
+
+| Entrypoint | Role | Replicas |
+|------------|------|----------|
+| `api_main.py` | HTTP only | Scale on request volume |
+| `worker_main.py` | Worker pool only | Scale on queue depth |
+| `scheduler_main.py` | Delayed-queue scheduler | **Exactly one** |
+
+The scheduler is a singleton. `DelayedQueue.poll` pushes a due job onto the
+main queue before removing it from the delayed set, so two schedulers polling
+together will requeue the same job twice.
+
+Splitting the API from the workers is what makes queue-depth autoscaling
+possible at all — while they share a process, scaling for backlog also
+multiplies HTTP replicas that were never the bottleneck.
+
+`main.py` still runs all three in one process for local development.
 
 ---
 
@@ -226,10 +318,20 @@ orion-queue/
 ├── retry_manager.py       # Exponential backoff with jitter
 ├── worker.py              # Single worker thread: pop → lookup → execute
 ├── worker_pool.py         # N workers + heartbeat monitor + auto-replacement
-├── api.py                 # FastAPI: /submit /status /metrics
-├── main.py                # Entry point: boots pool, scheduler, and API
+├── api.py                 # FastAPI: /submit /status /metrics /stats /health /ready
+├── config.py              # Environment-driven configuration and the Redis client
+├── metrics.py             # Prometheus collectors, including the SLI histograms
+├── probes.py              # Stdlib HTTP server giving the worker and scheduler probes
 ├── tasks.py               # Registered task definitions
+│
+├── main.py                # Local development: all three roles in one process
+├── api_main.py            # Container entrypoint: API only
+├── worker_main.py         # Container entrypoint: worker pool only
+├── scheduler_main.py      # Container entrypoint: scheduler only, single replica
+│
 ├── benchmark.py           # Throughput, latency, priority, and scaling benchmarks
 ├── test_queue.py          # pytest test suite
-└── docker-compose.yml     # Redis 7
+├── test_pool.py           # Manual worker pool smoke check, not a pytest test
+├── Dockerfile             # Multi-stage, non-root, one image for all three roles
+└── docker-compose.yml     # Redis plus the three processes
 ```

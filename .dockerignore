@@ -1,0 +1,19 @@
+.git
+.gitignore
+.github
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.vscode/
+.idea/
+
+# Tests run in CI against the source, not inside the shipped image.
+test_*.py
+
+# Documentation and local tooling
+README.md
+Dockerfile
+.dockerignore
+docker-compose.yml

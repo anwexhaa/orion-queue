@@ -1,6 +1,63 @@
-version: "3.8"
+# Local stack, shaped like the Kubernetes deployment: one API, one worker
+# process, one scheduler, all from the same image, differing only in command
+# and environment.
+#
+#   docker compose up --build
+#
+# For the old single-process workflow, start Redis alone and run main.py:
+#
+#   docker compose up -d redis
+#   python main.py
+
 services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "${REDIS_PUBLISH_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    command: ["python", "api_main.py"]
+    environment:
+      REDIS_HOST: redis
+      ORION_ROLE: api
+    ports:
+      - "${API_PUBLISH_PORT:-8000}:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["python", "worker_main.py"]
+    environment:
+      REDIS_HOST: redis
+      ORION_ROLE: worker
+      WORKER_COUNT: "4"
+    # Probes and metrics on the host at 8001, so all three are reachable
+    # without a port collision.
+    ports:
+      - "${WORKER_PUBLISH_PORT:-8001}:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  scheduler:
+    build: .
+    command: ["python", "scheduler_main.py"]
+    environment:
+      REDIS_HOST: redis
+      ORION_ROLE: scheduler
+    # Singleton. Two schedulers would requeue the same due job twice.
+    deploy:
+      replicas: 1
+    ports:
+      - "${SCHEDULER_PUBLISH_PORT:-8002}:8000"
+    depends_on:
+      redis:
+        condition: service_healthy

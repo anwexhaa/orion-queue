@@ -1,12 +1,26 @@
-import redis
 import json
-from job import Job
 from datetime import datetime
 
+import config
+from job import Job
+
 class RedisPriorityQueue:
-    def __init__(self, host="localhost", port=6379, queue_key="task_queue", client=None):
-        self.client = client if client else redis.Redis(host=host, port=port, decode_responses=True)
-        self.queue_key = queue_key
+    def __init__(self, host=None, port=None, queue_key=None, client=None):
+        # Defaults now come from the environment rather than being baked in,
+        # so the same code runs against localhost on a laptop and against a
+        # Redis Service in the cluster. Passing host/port/queue_key
+        # explicitly still works and still wins.
+        if client:
+            self.client = client
+        else:
+            overrides = {}
+            if host is not None:
+                overrides["host"] = host
+            if port is not None:
+                overrides["port"] = port
+            self.client = config.redis_client(**overrides)
+
+        self.queue_key = queue_key if queue_key is not None else config.QUEUE_KEY
 
     def push(self, job: Job):
         timestamp = datetime.fromisoformat(job.submit_time).timestamp()

@@ -1,4 +1,4 @@
-import redis
+import config
 import time
 import threading
 from job import Job, JobPriority
@@ -10,7 +10,7 @@ from task_registry import TaskRegistry
 from worker_pool import WorkerPool
 
 # ── setup ──────────────────────────────────────────────────────────────────
-r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+r = config.redis_client()
 r.delete("bench_queue")
 r.delete("bench_dlq")
 r.delete("bench_delayed")

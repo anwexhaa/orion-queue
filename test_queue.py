@@ -1,5 +1,5 @@
 import pytest
-import redis
+import config
 import time
 from job import Job, JobStatus, JobPriority
 from priority_queue import RedisPriorityQueue
@@ -7,7 +7,7 @@ from delayed_queue import DelayedQueue
 from dead_letter_queue import DeadLetterQueue
 from retry_manager import RetryManager
 
-r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+r = config.redis_client()
 
 def make_queue():
     q = RedisPriorityQueue(client=r, queue_key="test_queue")
