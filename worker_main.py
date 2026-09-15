@@ -18,6 +18,7 @@ import probes
 import tasks  # noqa: F401  -- importing registers every task
 from dead_letter_queue import DeadLetterQueue
 from delayed_queue import DelayedQueue
+from job_store import JobStore
 from priority_queue import RedisPriorityQueue
 from retry_manager import RetryManager
 from worker_pool import WorkerPool
@@ -36,9 +37,13 @@ def main() -> int:
     dlq = DeadLetterQueue(client=r, dlq_key=config.DLQ_KEY)
     delayed = DelayedQueue(client=r, delayed_key=config.DELAYED_KEY)
     retry_manager = RetryManager(delayed, dlq)
+    job_store = JobStore(r)
 
     pool = WorkerPool(
-        n_workers=config.WORKER_COUNT, queue=queue, retry_manager=retry_manager
+        n_workers=config.WORKER_COUNT,
+        queue=queue,
+        retry_manager=retry_manager,
+        job_store=job_store,
     )
     pool.start()
     metrics.workers_alive.set(len(pool.workers))

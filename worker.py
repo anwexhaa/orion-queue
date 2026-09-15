@@ -8,10 +8,13 @@ from task_registry import TaskRegistry
 
 
 class Worker:
-    def __init__(self, worker_id: str, queue, retry_manager):
+    def __init__(self, worker_id: str, queue, retry_manager, job_store=None):
         self.id = worker_id
         self.queue = queue
         self.retry_manager = retry_manager
+        # Optional so the existing benchmark and pool check, which never
+        # needed a store, keep working unchanged.
+        self.job_store = job_store
         self.last_heartbeat = datetime.now()
         self.current_job: Job | None = None
         self._running = True
@@ -22,6 +25,11 @@ class Worker:
 
     def stop(self):
         self._running = False
+
+    def _persist(self, job: Job):
+        """Write the job's current state so /status/{id} reflects reality."""
+        if self.job_store:
+            self.job_store.save(job)
 
     def _record_dispatch_latency(self, job: Job):
         """Time from submission to this worker picking the job up.
@@ -51,6 +59,7 @@ class Worker:
 
             self.current_job = job
             job.status = JobStatus.RUNNING
+            self._persist(job)
             self._record_dispatch_latency(job)
 
             started = time.perf_counter()
@@ -58,12 +67,14 @@ class Worker:
                 task_fn = TaskRegistry.get(job.task_name)
                 task_fn(job.payload)
                 job.status = JobStatus.DONE
+                self._persist(job)
                 metrics.jobs_processed.labels(
                     task_name=job.task_name, status=JobStatus.DONE.value
                 ).inc()
             except Exception as e:
                 print(f"[worker {self.id[:8]}] job {job.task_name} failed: {e}")
                 self.retry_manager.handle_failure(job, str(e))
+                self._persist(job)
                 # handle_failure decides between another retry and the dead
                 # letter queue, and records that decision on the job.
                 if job.status == JobStatus.DEAD:

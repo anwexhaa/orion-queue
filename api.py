@@ -7,6 +7,7 @@ import config
 import metrics
 from dead_letter_queue import DeadLetterQueue
 from job import Job, JobPriority
+from job_store import JobStore
 from priority_queue import RedisPriorityQueue
 
 app = FastAPI(title="Orion Queue", version="1.0.0")
@@ -14,6 +15,7 @@ app = FastAPI(title="Orion Queue", version="1.0.0")
 r = config.redis_client()
 queue = RedisPriorityQueue(client=r, queue_key=config.QUEUE_KEY)
 dlq = DeadLetterQueue(client=r, dlq_key=config.DLQ_KEY)
+job_store = JobStore(r)
 
 
 class SubmitRequest(BaseModel):
@@ -32,7 +34,7 @@ def submit_job(req: SubmitRequest):
         max_retries=req.max_retries,
     )
     # write status key BEFORE pushing to queue to avoid race condition
-    r.set(f"job:{job.id}", json.dumps(job.to_dict()))
+    job_store.save(job)
     queue.push(job)
     metrics.jobs_submitted.labels(task_name=job.task_name).inc()
     return {"job_id": job.id, "status": job.status.value}
@@ -40,10 +42,10 @@ def submit_job(req: SubmitRequest):
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
-    data = r.get(f"job:{job_id}")
-    if not data:
+    record = job_store.get(job_id)
+    if not record:
         raise HTTPException(status_code=404, detail="Job not found")
-    return json.loads(data)
+    return record
 
 
 # --- Probes ----------------------------------------------------------------

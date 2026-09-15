@@ -87,6 +87,12 @@ workers_alive = Gauge(
     registry=REGISTRY,
 )
 
+workers_replaced_total = Counter(
+    "orion_workers_replaced_total",
+    "Workers replaced by the heartbeat monitor after stalling",
+    registry=REGISTRY,
+)
+
 redis_up = Gauge(
     "orion_redis_up",
     "1 when the last Redis round-trip from this process succeeded",

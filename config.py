@@ -49,6 +49,10 @@ DELAYED_KEY = os.getenv("DELAYED_KEY", "delayed_queue")
 
 # --- Process shape ---------------------------------------------------------
 
+# How long a job record survives in Redis after it is written. Without a
+# TTL, every job ever submitted leaves a permanent key behind.
+JOB_TTL_SECONDS = _int("JOB_TTL_SECONDS", 86400)
+
 WORKER_COUNT = _int("WORKER_COUNT", 4)
 SCHEDULER_POLL_INTERVAL = _float("SCHEDULER_POLL_INTERVAL", 0.5)
 
