@@ -1,6 +1,7 @@
 import json
+import time
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 
 import config
@@ -16,6 +17,53 @@ r = config.redis_client()
 queue = RedisPriorityQueue(client=r, queue_key=config.QUEUE_KEY)
 dlq = DeadLetterQueue(client=r, dlq_key=config.DLQ_KEY)
 job_store = JobStore(r)
+
+# A second client with one-second timeouts, used only by the probe and metrics
+# paths.
+#
+# Prometheus gives up on a scrape after 10 seconds by default. Reading queue
+# depth through the main client, which waits five, means a degraded Redis can
+# push /metrics past that limit - so the monitoring goes blind at exactly the
+# moment the service is in trouble. The readiness probe has the same problem
+# with a tighter budget.
+probe_r = config.redis_client(socket_timeout=1, socket_connect_timeout=1)
+probe_queue = RedisPriorityQueue(client=probe_r, queue_key=config.QUEUE_KEY)
+probe_dlq = DeadLetterQueue(client=probe_r, dlq_key=config.DLQ_KEY)
+
+# Paths excluded from the HTTP metrics.
+#
+# The kubelet hits /health and /ready every few seconds and Prometheus scrapes
+# /metrics on its own interval. Counting those would mean the availability SLI
+# is dominated by the monitoring system checking itself: the number would sit
+# at four nines while every real user request failed, because probe traffic
+# outnumbers user traffic by orders of magnitude.
+#
+# An SLI has to measure what a user experiences.
+SLI_EXCLUDED_ROUTES = frozenset({"/health", "/ready", "/metrics", "/stats"})
+
+
+@app.middleware("http")
+async def record_http_metrics(request: Request, call_next):
+    started = time.perf_counter()
+    status = 500  # if call_next raises, the client still saw a failure
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        # Set by the router once a route matches. Unmatched paths collapse to
+        # a single "unmatched" label rather than becoming one time series per
+        # URL anyone happens to request.
+        route = request.scope.get("route")
+        template = getattr(route, "path", None) or "unmatched"
+
+        if template not in SLI_EXCLUDED_ROUTES:
+            metrics.http_requests_total.labels(
+                method=request.method, route=template, status=str(status)
+            ).inc()
+            metrics.http_request_duration.labels(
+                method=request.method, route=template
+            ).observe(time.perf_counter() - started)
 
 
 class SubmitRequest(BaseModel):
@@ -69,7 +117,7 @@ def health():
 @app.get("/ready")
 def ready(response: Response):
     try:
-        r.ping()
+        probe_r.ping()
     except Exception as exc:
         metrics.redis_up.set(0)
         response.status_code = 503
@@ -89,8 +137,8 @@ def _refresh_depth_gauges() -> tuple[int, int]:
     cheaper than maintaining a running count that can drift.
     """
     try:
-        depth = queue.size()
-        dead = dlq.size()
+        depth = probe_queue.size()
+        dead = probe_dlq.size()
     except Exception:
         metrics.redis_up.set(0)
         raise

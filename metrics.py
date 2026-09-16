@@ -33,6 +33,27 @@ DURATION_BUCKETS = (
     0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 )
 
+# --- HTTP, the availability SLI -------------------------------------------
+#
+# Labelled by ROUTE TEMPLATE, never the raw path. "/status/{job_id}" is one
+# time series; "/status/<uuid>" would be one series per job ever submitted,
+# which is how a metrics backend gets taken down by its own instrumentation.
+
+http_requests_total = Counter(
+    "orion_http_requests_total",
+    "HTTP requests handled by the API",
+    ["method", "route", "status"],
+    registry=REGISTRY,
+)
+
+http_request_duration = Histogram(
+    "orion_http_request_duration_seconds",
+    "Time to serve an HTTP request",
+    ["method", "route"],
+    buckets=DISPATCH_BUCKETS,
+    registry=REGISTRY,
+)
+
 jobs_submitted = Counter(
     "orion_jobs_submitted_total",
     "Jobs accepted by the API",

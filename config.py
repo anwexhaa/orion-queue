@@ -12,6 +12,8 @@ that must always be supplied there.
 import os
 
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 
 def _int(name: str, default: int) -> int:
@@ -80,8 +82,16 @@ def redis_client(**overrides) -> redis.Redis:
         decode_responses=True,
         socket_connect_timeout=5,
         socket_timeout=5,
-        # redis-py retries on TimeoutError by default since 6.0, so passing
-        # retry_on_timeout here would only raise a deprecation warning.
+        # One attempt, no backoff. redis-py's default is three retries with
+        # exponential backoff, which sounds prudent and is not: with Redis
+        # down, a single /submit took 48 seconds to return its 500, because
+        # each of two Redis calls burned the full retry budget first.
+        #
+        # Requests that are certainly going to fail should fail immediately.
+        # Slow failures fill the worker pool, so a dependency outage becomes
+        # a total outage, and the client has usually given up long before the
+        # retries finish anyway.
+        retry=Retry(NoBackoff(), 0),
         health_check_interval=30,
     )
     params.update(overrides)
