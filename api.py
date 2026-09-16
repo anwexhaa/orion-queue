@@ -41,6 +41,10 @@ probe_dlq = DeadLetterQueue(client=probe_r, dlq_key=config.DLQ_KEY)
 # An SLI has to measure what a user experiences.
 SLI_EXCLUDED_ROUTES = frozenset({"/health", "/ready", "/metrics", "/stats"})
 
+# Create every SLI series at zero before the first request. See
+# metrics.init_http_series for why the first outage is otherwise invisible.
+metrics.init_http_series()
+
 
 @app.middleware("http")
 async def record_http_metrics(request: Request, call_next):

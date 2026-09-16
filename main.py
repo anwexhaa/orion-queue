@@ -13,15 +13,18 @@ Kept because it is still the fastest way to run the whole system on a laptop:
 import uvicorn
 
 import config
+import metrics
 import tasks  # noqa: F401  -- importing registers every task
 from dead_letter_queue import DeadLetterQueue
 from delayed_queue import DelayedQueue, DelayedQueueScheduler
 from job_store import JobStore
 from priority_queue import RedisPriorityQueue
 from retry_manager import RetryManager
+from task_registry import TaskRegistry
 from worker_pool import WorkerPool
 
 r = config.redis_client()
+metrics.init_job_series(TaskRegistry._registry)
 queue = RedisPriorityQueue(client=r, queue_key=config.QUEUE_KEY)
 dlq = DeadLetterQueue(client=r, dlq_key=config.DLQ_KEY)
 dq = DelayedQueue(client=r, delayed_key=config.DELAYED_KEY)

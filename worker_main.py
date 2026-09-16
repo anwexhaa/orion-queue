@@ -21,6 +21,7 @@ from delayed_queue import DelayedQueue
 from job_store import JobStore
 from priority_queue import RedisPriorityQueue
 from retry_manager import RetryManager
+from task_registry import TaskRegistry
 from worker_pool import WorkerPool
 
 # How long to let an in-flight job finish after SIGTERM. Kubernetes sends
@@ -33,6 +34,7 @@ def main() -> int:
     print(f"[worker] starting {config.summary()}", flush=True)
 
     r = config.redis_client()
+    metrics.init_job_series(TaskRegistry._registry)
     queue = RedisPriorityQueue(client=r, queue_key=config.QUEUE_KEY)
     dlq = DeadLetterQueue(client=r, dlq_key=config.DLQ_KEY)
     delayed = DelayedQueue(client=r, delayed_key=config.DELAYED_KEY)
@@ -48,10 +50,20 @@ def main() -> int:
     pool.start()
     metrics.workers_alive.set(len(pool.workers))
 
+    # One round trip, on a client with one-second timeouts. Game day 3 found
+    # the original version making two calls on the main five-second client -
+    # a ping and a queue-depth read - so 500ms of Redis latency took each
+    # probe to about a second, past the kubelet's 1s timeout, and every worker
+    # and the scheduler went NotReady together. Harmless for workers, which
+    # have no Service; fatal if the same pattern were on the API.
+    #
+    # Queue depth is not read here at all. Readiness must be cheap and must
+    # answer one question, and the API already reports depth on /metrics.
+    probe_r = config.redis_client(socket_timeout=1, socket_connect_timeout=1)
+
     def ready() -> bool:
-        r.ping()
+        probe_r.ping()
         metrics.workers_alive.set(len(pool.workers))
-        metrics.queue_depth.set(queue.size())
         return True
 
     probes.serve(config.HTTP_HOST, config.HTTP_PORT, ready)

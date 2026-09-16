@@ -121,6 +121,40 @@ redis_up = Gauge(
 )
 
 
+# --- Series initialisation ---------------------------------------------------
+#
+# A labelled counter child does not exist until its first .inc(). If the first
+# events for a label combination arrive between two scrapes, Prometheus first
+# sees that series already at N, never at 0, and increase()/rate() over it read
+# N - N = 0. The events happened; the SLI cannot see them.
+#
+# Found in game day 2: four real 500s during a Redis outage, and the
+# availability SLI recorded none, because the status="500" series was born
+# mid-outage at value 4. The first burst of any status code the process had not
+# produced before was invisible - which in practice means the first outage.
+#
+# Calling .labels() without .inc() creates the child at zero, so Prometheus
+# observes the 0 -> N transition and counts it.
+
+HTTP_SERIES = (
+    ("POST", "/submit", ("200", "422", "500", "503")),
+    ("GET", "/status/{job_id}", ("200", "404", "500", "503")),
+)
+
+
+def init_http_series() -> None:
+    for method, route, statuses in HTTP_SERIES:
+        for status in statuses:
+            http_requests_total.labels(method=method, route=route, status=status)
+
+
+def init_job_series(task_names) -> None:
+    for name in task_names:
+        for status in ("done", "dead"):
+            jobs_processed.labels(task_name=name, status=status)
+        job_retries.labels(task_name=name)
+
+
 def render() -> tuple[bytes, str]:
     """Metrics in the Prometheus text exposition format, with its content type."""
     return generate_latest(REGISTRY), CONTENT_TYPE_LATEST

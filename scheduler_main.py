@@ -31,9 +31,12 @@ def main() -> int:
     )
     scheduler.start()
 
+    # One cheap round trip on a fast client. See worker_main.ready for the
+    # game day 3 finding this fixes.
+    probe_r = config.redis_client(socket_timeout=1, socket_connect_timeout=1)
+
     def ready() -> bool:
-        r.ping()
-        metrics.queue_depth.set(queue.size())
+        probe_r.ping()
         return True
 
     probes.serve(config.HTTP_HOST, config.HTTP_PORT, ready)

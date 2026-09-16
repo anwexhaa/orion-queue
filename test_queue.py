@@ -161,3 +161,51 @@ def test_job_store_records_terminal_status():
 
 def test_job_store_returns_none_for_unknown_job():
     assert JobStore(r).get("does-not-exist") is None
+
+
+def _series_value(text, name, **labels):
+    """Value of one exposed series, or None if the series is absent."""
+    want = ",".join(f'{k}="{v}"' for k, v in labels.items())
+    for line in text.splitlines():
+        if line.startswith(name + "{") and all(f'{k}="{v}"' in line for k, v in labels.items()):
+            return float(line.rsplit(" ", 1)[1])
+    return None
+
+
+def test_http_error_series_exists_before_any_error():
+    """Regression, from game day 2.
+
+    Four real 500s during a Redis outage and the availability SLI recorded
+    none: the status="500" series did not exist until the first error, so
+    Prometheus first saw it already at 4 and increase() read 4 - 4 = 0.
+
+    The series must be exposed at zero before the first error ever happens.
+    """
+    import api  # noqa: F401 - importing initialises the series
+    import metrics
+
+    body, _ = metrics.render()
+    text = body.decode()
+
+    value = _series_value(
+        text, "orion_http_requests_total",
+        method="POST", route="/submit", status="500",
+    )
+    assert value is not None, "500 series must exist before the first 500"
+    assert value == 0.0
+
+
+def test_job_outcome_series_exist_for_registered_tasks():
+    import metrics
+    from task_registry import TaskRegistry
+
+    TaskRegistry.register("series_probe")(lambda payload: None)
+    metrics.init_job_series(["series_probe"])
+
+    text = metrics.render()[0].decode()
+    assert _series_value(
+        text, "orion_jobs_processed_total", task_name="series_probe", status="dead"
+    ) == 0.0
+    assert _series_value(
+        text, "orion_job_retries_total", task_name="series_probe"
+    ) == 0.0
