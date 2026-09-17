@@ -134,7 +134,7 @@ def ready(response: Response):
 # --- Metrics ---------------------------------------------------------------
 
 
-def _refresh_depth_gauges() -> tuple[int, int]:
+def _refresh_depth_gauges() -> tuple[int, int, int]:
     """Read the two queue depths, updating the gauges as a side effect.
 
     Both are O(1) in Redis (ZCARD and LLEN), so doing this per scrape is
@@ -143,6 +143,7 @@ def _refresh_depth_gauges() -> tuple[int, int]:
     try:
         depth = probe_queue.size()
         dead = probe_dlq.size()
+        in_flight = probe_queue.in_flight()
     except Exception:
         metrics.redis_up.set(0)
         raise
@@ -150,7 +151,8 @@ def _refresh_depth_gauges() -> tuple[int, int]:
     metrics.redis_up.set(1)
     metrics.queue_depth.set(depth)
     metrics.dead_letter_depth.set(dead)
-    return depth, dead
+    metrics.jobs_in_flight.set(in_flight)
+    return depth, dead, in_flight
 
 
 @app.get("/metrics")
@@ -176,5 +178,7 @@ def stats():
     exposition format. See decision D6 in the Helios repo: the queue is a
     Redis sorted set, so KEDA's redis scaler cannot measure it.
     """
-    depth, dead = _refresh_depth_gauges()
-    return {"queue_size": depth, "dead_jobs": dead}
+    depth, dead, in_flight = _refresh_depth_gauges()
+    # queue_size is what KEDA scales on and must keep its name. in_flight is
+    # additive: jobs leased to a worker right now.
+    return {"queue_size": depth, "dead_jobs": dead, "in_flight": in_flight}

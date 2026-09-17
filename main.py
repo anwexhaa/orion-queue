@@ -18,6 +18,7 @@ import tasks  # noqa: F401  -- importing registers every task
 from dead_letter_queue import DeadLetterQueue
 from delayed_queue import DelayedQueue, DelayedQueueScheduler
 from job_store import JobStore
+from lease_reaper import LeaseReaper
 from priority_queue import RedisPriorityQueue
 from retry_manager import RetryManager
 from task_registry import TaskRegistry
@@ -33,6 +34,7 @@ job_store = JobStore(r)
 
 scheduler = DelayedQueueScheduler(dq, queue, poll_interval=config.SCHEDULER_POLL_INTERVAL)
 scheduler.start()
+LeaseReaper(queue).start()
 
 pool = WorkerPool(
     n_workers=config.WORKER_COUNT, queue=queue, retry_manager=rm, job_store=job_store

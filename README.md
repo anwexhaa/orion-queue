@@ -23,11 +23,15 @@ FastAPI (/submit)
     ▼
 RedisPriorityQueue  ◄──────────────────────────────┐
     │  Redis sorted set, score = priority           │
-    │  zpopmax = atomic pop, no duplicate execution │
+    │  pop = atomic ZPOPMAX + lease, one script     │
+    ▼                                               │
+Processing set (lease per job) ── reaper requeues ──┤
+    │  renewed while the job runs                   │  expired leases
     ▼                                               │
 Worker (one of N threads)                          │
     │  looks up task function by name              │
     │  executes task_fn(payload)                   │
+    │  acks on the next pop, in the same round trip│
     │                                              │
     ├─ success → job.status = DONE                 │
     │                                              │
@@ -76,43 +80,77 @@ Delay after attempt N = `0.5 * (2^N) + random(0, 0.5)`. The exponential part mea
 
 Failed jobs that exhaust retries land in a Redis list. They're inspectable, persistent across restarts, and queryable via the API. A log line disappears when the process dies. A DLQ entry doesn't.
 
-**Worker heartbeat monitoring.**
+**Two layers of recovery: heartbeats inside a process, leases across processes.**
 
-Each worker updates a `last_heartbeat` timestamp after every operation. A monitor thread checks all workers every second — if any worker hasn't updated in 10 seconds, it's assumed stuck, its current job is requeued, and it's replaced with a fresh worker. The pool size stays constant without manual intervention.
+Each worker updates a `last_heartbeat` timestamp after every operation. A monitor thread checks all workers every second — if one hasn't updated in 10 seconds, it's assumed wedged, its current job is requeued, and it's replaced with a fresh thread.
+
+That only works while the process is alive. A chaos experiment that killed a worker pod mid-job lost four jobs: `ZPOPMAX` had already removed them from Redis, and the monitor that would have requeued them died with the pod. Nothing alerted, because a job that never finishes never increments any counter.
+
+So a pop no longer deletes. One Lua script pops the job and records a **lease** — a deadline in a processing set — atomically. The pool renews its workers' leases every third of the lease period while jobs run. If the process dies, renewals stop, the lease expires, and a reaper in the scheduler requeues the job with its original priority. A crashed worker's jobs come back within `LEASE_SECONDS + REAP_INTERVAL`, and every expiry is counted in `orion_leases_expired_total`, so a dying worker is visible.
+
+**At-least-once delivery, not exactly-once.**
+
+A worker that finishes a job just after its lease expired, or dies between finishing and acknowledging, means the job runs twice. That is the price of never losing one, and it is the same trade SQS visibility timeouts and Sidekiq's reliable fetch make. Tasks must be idempotent. Late acknowledgements are counted in `orion_lease_ack_late_total`; a rising rate means the lease is too short for the real tasks.
+
+Three details keep the duplicates rare. A worker acknowledges a job only once its outcome is durably recorded — if recording a failure itself fails, it keeps the lease, so the job is retried rather than dropped. Requeueing a stalled job is conditional on still holding its lease, so the monitor and the reaper can never both put it back. And a graceful stop flushes the last acknowledgement before the process exits.
+
+**The acknowledgement rides on the next pop.**
+
+Leasing alone doubled the Redis round trips per job — pop, then ack — and roughly halved throughput on the benchmark, where the task does nothing and round trips are the whole cost. `take()` acknowledges the previous job and leases the next in one script, which brought throughput back to the pre-lease level. See the benchmark below.
 
 ---
 
 ## Benchmarks
 
-Run on Windows, Python 3.12, Redis 7 via Docker (localhost).
+```bash
+python benchmark.py            # median of 5 repeats
+python benchmark.py --repeat 9
+```
 
-### Push/Pop latency
+Windows 11, Python 3.12, Redis 7 in Docker Desktop on localhost. Every figure is the **median of 5 repeats**; the range across repeats is shown because it is wide, and a single run on this setup can land anywhere inside it.
 
-| Operation | 1000 ops | Avg per op |
-|-----------|----------|------------|
-| Push      | 0.489s   | 0.489ms    |
-| Pop       | 0.530s   | 0.530ms    |
+An earlier version of this benchmark timed a few hundred jobs finishing in about a tenth of a second, where thread start-up and scheduler noise dominated — the same machine reported 1,168 to 2,256 jobs/sec for one worker on consecutive runs. It now runs long enough to measure the queue rather than the timer, and the older figures that used to be quoted here could not be reproduced by it.
 
-Sub-millisecond per operation. This is the Redis round trip on localhost — expect 1–5ms in a real network environment depending on Redis proximity.
+### Latency per operation
 
-### Throughput
+| Operation | Median | Range |
+|-----------|--------|-------|
+| push | 0.42 ms | 0.40–0.69 |
+| take — ack the previous job and lease the next | **0.51 ms** | 0.50–0.52 |
 
-500 jobs processed end-to-end with 4 workers: **1,710 jobs/sec**
+For comparison, the old destructive pop was 0.42 ms, and leased pop followed by a separate ack was 0.90 ms. This is the localhost round trip; expect 1–5 ms against Redis on a real network.
 
-### Priority correctness under load
+### Drain throughput
 
-200 jobs submitted across 4 priority levels simultaneously. First 50 processed were 100% CRITICAL priority. The sorted set ordering holds under concurrent load, not just in unit tests.
+4,000 no-op jobs already queued, drained by a pool of N worker threads.
 
-### Worker scaling
+| Workers | Before leases | Leases, pop + ack | **Leases, take()** |
+|---------|---------------|-------------------|--------------------|
+| 1 | 1,594 /s | 1,030 /s | **1,828 /s** |
+| 2 | 1,944 /s | 1,584 /s | **2,672 /s** |
+| 4 | 4,160 /s | 2,164 /s | **4,386 /s** |
+| 8 | 4,423 /s | 2,336 /s | **4,543 /s** |
 
-| Workers | Time   | Throughput   |
-|---------|--------|--------------|
-| 1       | 0.188s | 2,125 j/s    |
-| 2       | 0.134s | 2,981 j/s    |
-| 4       | 0.073s | 5,452 j/s    |
-| 8       | 0.073s | 5,459 j/s    |
+With `take()`, leasing has no measurable throughput cost — the differences from the pre-lease column are inside run-to-run noise. Throughput rises with workers up to 4 and then flattens: past that point a single Redis instance, not the pool, is the constraint.
 
-Throughput scales linearly from 1→4 workers, then plateaus at 8. The bottleneck shifts from workers to Redis — a single Redis instance saturates before the worker pool does. The production fix is Redis Cluster or sharding the queue across multiple Redis instances.
+Because the task does nothing, these numbers are an upper bound on queue overhead, not a prediction of real throughput. With real work — even the 2-second `slow_task` — the task dominates and the queue's cost is noise.
+
+### Priority ordering
+
+200 jobs across four priorities, drained by one worker: execution order was exactly descending priority on every repeat.
+
+### Crash recovery
+
+`scripts/crash-test.sh` reproduces the chaos experiment without a cluster. It runs the API, scheduler and a 4-thread worker on a private Docker network, submits 40 two-second jobs, kills the worker while it holds a full batch, starts a replacement, and then reads every job record.
+
+| Code | Signal | Runs | Done | Lost | Leases reaped |
+|------|--------|------|------|------|---------------|
+| before leases | SIGKILL | 4 | 36 of 40 | **4** | — |
+| leases, pop + ack | SIGKILL | 4 | 40 of 40 | **0** | 4, every run |
+| leases, take() | SIGKILL | 3 | 40 of 40 | **0** | 4, every run |
+| leases, take() | SIGTERM | 1 | 40 of 40 | **0** | 0 — drained and acknowledged its own jobs |
+
+The run against the old code matters as much as the new one: had it lost nothing, the harness would not have been killing mid-job, and a clean result on the new code would prove nothing.
 
 ---
 
@@ -199,8 +237,10 @@ GET /stats
 ```
 
 ```json
-{"queue_size": 12, "dead_jobs": 0}
+{"queue_size": 12, "dead_jobs": 0, "in_flight": 4}
 ```
+
+`in_flight` is the number of jobs currently leased to a worker.
 
 The original JSON payload, kept because KEDA's `metrics-api` scaler reads JSON
 rather than the Prometheus format.
@@ -237,6 +277,8 @@ to be hardcoded, so nothing needs setting to run locally.
 | `DLQ_KEY` | `dead_letter_queue` | |
 | `DELAYED_KEY` | `delayed_queue` | |
 | `WORKER_COUNT` | `4` | Threads per worker process |
+| `LEASE_SECONDS` | `30` | How long a job is leased to the worker that took it. Renewed every third of this while it runs |
+| `REAP_INTERVAL` | `5` | Seconds between checks for expired leases. Worst-case recovery is `LEASE_SECONDS + REAP_INTERVAL` |
 | `SCHEDULER_POLL_INTERVAL` | `0.5` | Seconds |
 | `HTTP_HOST` | `0.0.0.0` | |
 | `HTTP_PORT` | `8000` | |
@@ -302,7 +344,14 @@ Workers look up tasks by name at runtime. If a task name isn't registered, the j
 pytest test_queue.py -v
 ```
 
-4 tests covering priority ordering, retry-to-dead flow, delayed queue requeuing, and DLQ persistence. All tests use isolated Redis keys so they don't interfere with a running instance.
+27 tests. Beyond priority ordering, retries and the dead letter queue, they cover leased fetch — a job held by a dead worker is recovered, keeps its priority, and is not duplicated when a stalled worker is also requeued — the worker's acknowledgement rules, the heartbeat monitor, and the SLI series being exposed before the first error. They need a local Redis (`docker compose up -d redis`) and use isolated keys, so they don't interfere with a running instance.
+
+For the crash behaviour end to end, against a built image:
+
+```bash
+docker build -t orion-queue:local .
+./scripts/crash-test.sh orion-queue:local
+```
 
 ---
 
@@ -312,12 +361,13 @@ pytest test_queue.py -v
 orion-queue/
 ├── job.py                 # Job dataclass, status and priority enums
 ├── task_registry.py       # Decorator-based task registration
-├── priority_queue.py      # Redis sorted set queue with priority + FIFO tiebreaker
+├── priority_queue.py      # Priority queue with leased fetch, ack, renew and reap
+├── lease_reaper.py        # Requeues jobs whose worker stopped renewing its lease
 ├── delayed_queue.py       # Retry scheduling without blocking threads
 ├── dead_letter_queue.py   # Persistent storage for exhausted jobs
 ├── retry_manager.py       # Exponential backoff with jitter
-├── worker.py              # Single worker thread: pop → lookup → execute
-├── worker_pool.py         # N workers + heartbeat monitor + auto-replacement
+├── worker.py              # Single worker thread: take → execute → ack on next take
+├── worker_pool.py         # N workers, heartbeat monitor, lease renewal
 ├── api.py                 # FastAPI: /submit /status /metrics /stats /health /ready
 ├── config.py              # Environment-driven configuration and the Redis client
 ├── metrics.py             # Prometheus collectors, including the SLI histograms
@@ -327,9 +377,10 @@ orion-queue/
 ├── main.py                # Local development: all three roles in one process
 ├── api_main.py            # Container entrypoint: API only
 ├── worker_main.py         # Container entrypoint: worker pool only
-├── scheduler_main.py      # Container entrypoint: scheduler only, single replica
+├── scheduler_main.py      # Container entrypoint: delayed-queue scheduler and lease reaper
 │
-├── benchmark.py           # Throughput, latency, priority, and scaling benchmarks
+├── benchmark.py           # Latency, throughput and priority, median of repeats
+├── scripts/crash-test.sh  # Kill a worker mid-job and count what was lost
 ├── test_queue.py          # pytest test suite
 ├── test_pool.py           # Manual worker pool smoke check, not a pytest test
 ├── Dockerfile             # Multi-stage, non-root, one image for all three roles

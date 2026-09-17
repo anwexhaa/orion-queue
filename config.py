@@ -55,6 +55,18 @@ DELAYED_KEY = os.getenv("DELAYED_KEY", "delayed_queue")
 # TTL, every job ever submitted leaves a permanent key behind.
 JOB_TTL_SECONDS = _int("JOB_TTL_SECONDS", 86400)
 
+# How long a popped job is leased to the worker that took it. The worker
+# renews every third of this while the job runs, so a live worker never loses
+# its lease; a dead one stops renewing, and the job is requeued once the lease
+# runs out. Shorter recovers crashed work faster; longer tolerates longer
+# pauses - a garbage collection stall or a Redis blip - before a job that is
+# still running is handed to a second worker.
+LEASE_SECONDS = _float("LEASE_SECONDS", 30.0)
+
+# How often the reaper looks for expired leases. Worst-case recovery time for
+# a crashed worker's jobs is LEASE_SECONDS + REAP_INTERVAL.
+REAP_INTERVAL = _float("REAP_INTERVAL", 5.0)
+
 WORKER_COUNT = _int("WORKER_COUNT", 4)
 SCHEDULER_POLL_INTERVAL = _float("SCHEDULER_POLL_INTERVAL", 0.5)
 

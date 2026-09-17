@@ -90,19 +90,20 @@ def main() -> int:
     for worker in pool.workers:
         worker.stop()
 
-    # Wait for in-flight jobs, but no longer than the grace period. Polling
-    # beats a flat sleep: a pool that drains in two seconds should not hold
-    # the pod open for twenty.
+    # Wait for each worker thread to EXIT, not merely to finish its job. A
+    # worker sends its last acknowledgement on the way out; waiting only for
+    # current_job to clear would let the process end first, the lease would
+    # expire, and the reaper would run a finished job again. Bounded by the
+    # grace period, and a pool that drains in two seconds exits in two.
     deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS
-    while time.monotonic() < deadline:
-        in_flight = sum(1 for w in pool.workers if w.current_job is not None)
-        if in_flight == 0:
-            break
-        time.sleep(0.2)
+    for w in pool.workers:
+        w.join(max(0.0, deadline - time.monotonic()))
 
-    in_flight = sum(1 for w in pool.workers if w.current_job is not None)
-    if in_flight:
-        print(f"[worker] {in_flight} job(s) still running at cutoff", flush=True)
+    still_running = sum(1 for w in pool.workers if w.is_alive())
+    if still_running:
+        # Their leases stay held; the reaper requeues those jobs once the
+        # leases expire. Duplicated at worst, never lost.
+        print(f"[worker] {still_running} worker(s) still busy at cutoff", flush=True)
     print("[worker] stopped", flush=True)
     return 0
 

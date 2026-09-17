@@ -2,7 +2,7 @@
 
 The two service level indicators Helios measures come from here:
 
-  availability — orion_jobs_processed_total split by status
+  availability — orion_http_requests_total, 5xx over total
   latency      — orion_dispatch_latency_seconds, the time between a job being
                  submitted and a worker picking it up
 
@@ -111,6 +111,26 @@ workers_alive = Gauge(
 workers_replaced_total = Counter(
     "orion_workers_replaced_total",
     "Workers replaced by the heartbeat monitor after stalling",
+    registry=REGISTRY,
+)
+
+jobs_in_flight = Gauge(
+    "orion_jobs_in_flight",
+    "Jobs currently leased to a worker",
+    registry=REGISTRY,
+)
+
+# Unlabelled, so both exist at zero from process start - no initialisation
+# needed for Prometheus to observe the first increment.
+leases_expired_total = Counter(
+    "orion_leases_expired_total",
+    "Jobs requeued because the worker holding them stopped renewing its lease",
+    registry=REGISTRY,
+)
+
+lease_ack_late_total = Counter(
+    "orion_lease_ack_late_total",
+    "Jobs finished after their lease had expired and been requeued; each is a duplicate execution",
     registry=REGISTRY,
 )
 

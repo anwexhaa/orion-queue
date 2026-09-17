@@ -16,6 +16,7 @@ import config
 import metrics
 import probes
 from delayed_queue import DelayedQueue, DelayedQueueScheduler
+from lease_reaper import LeaseReaper
 from priority_queue import RedisPriorityQueue
 
 
@@ -31,6 +32,9 @@ def main() -> int:
     )
     scheduler.start()
 
+    # Requeues jobs held by workers that died. See lease_reaper.py.
+    LeaseReaper(queue).start()
+
     # One cheap round trip on a fast client. See worker_main.ready for the
     # game day 3 finding this fixes.
     probe_r = config.redis_client(socket_timeout=1, socket_connect_timeout=1)
@@ -42,6 +46,7 @@ def main() -> int:
     probes.serve(config.HTTP_HOST, config.HTTP_PORT, ready)
     print(
         f"[scheduler] polling every {config.SCHEDULER_POLL_INTERVAL}s, "
+        f"reaping leases older than {config.LEASE_SECONDS}s, "
         f"probes on {config.HTTP_HOST}:{config.HTTP_PORT}",
         flush=True,
     )
